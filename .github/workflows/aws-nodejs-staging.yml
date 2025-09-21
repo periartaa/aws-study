@@ -1,0 +1,77 @@
+name: Build, Test, and Deploy to AWS Staging
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests
+        run: npm test
+
+      - name: Zip application for deployment
+        run: zip -r app.zip . -x '*.git*' 'node_modules/*' '*.github*'
+
+      - name: Copy artifact to EC2 via SCP and run remote deploy
+        uses: appleboy/scp-action@v0.1.4
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT }}
+          source: "app.zip"
+          target: "${{ secrets.EC2_APP_PATH }}/app.zip"
+
+      - name: SSH - unzip and restart app
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT }}
+          script: |
+            set -e
+            mkdir -p ${{ secrets.EC2_APP_PATH }}
+            cd ${{ secrets.EC2_APP_PATH }}
+            # backup previous release
+            if [ -d release ]; then
+              rm -rf release_old || true
+              mv release release_old || true
+            fi
+            mkdir -p release
+            unzip -o app.zip -d release
+            cd release
+            # Install production dependencies
+            if [ -f package-lock.json ]; then
+              npm ci --production
+            else
+              npm install --production
+            fi
+            # Use pm2 to run the app (install pm2 if necessary)
+            if ! command -v pm2 >/dev/null 2>&1; then
+              sudo npm install -g pm2
+            fi
+            # Stop existing pm2 process (by name) and start new one
+            pm2 stop ${{ secrets.EC2_PM2_APP_NAME }} || true
+            pm2 delete ${{ secrets.EC2_PM2_APP_NAME }} || true
+            pm2 start src/server.js --name ${{ secrets.EC2_PM2_APP_NAME }}
+            pm2 save
+            # Cleanup old release
+            rm -rf release_old || true
